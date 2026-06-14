@@ -352,6 +352,28 @@ class ManifestBuilder:
             "points.recall": {"label": "Recall", "direction": "higher"},
             "points.f1": {"label": "F1", "direction": "higher"},
         }
+
+        # Multi-threshold point cloud metrics.
+        # evaluate_pointcloud() emits keys like "precision_0.05" when
+        # len(thresholds) > 1.  Pre-register definitions for every common
+        # threshold so the frontend can render clean labels and correct
+        # sort direction.
+        for threshold in (0.01, 0.02, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.50):
+            suffix = f"{threshold:.4f}".rstrip('0').rstrip('.')
+            tau_label = f"{suffix} m"
+            definitions[f"points.precision_{suffix}"] = {
+                "label": f"Precision@{tau_label}",
+                "direction": "higher",
+            }
+            definitions[f"points.recall_{suffix}"] = {
+                "label": f"Recall@{tau_label}",
+                "direction": "higher",
+            }
+            definitions[f"points.f1_{suffix}"] = {
+                "label": f"F1@{tau_label}",
+                "direction": "higher",
+            }
+
         for threshold in (3, 5, 15, 30):
             definitions[f"auc.AUC_{threshold}"] = {
                 "label": f"AUC@{threshold}",

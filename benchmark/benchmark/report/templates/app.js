@@ -468,7 +468,7 @@ function metricDirection(category, metric) {
     if (category.startsWith('auc') || normalized.startsWith('auc') || normalized.startsWith('racc') || normalized.startsWith('tacc')) {
         return 1;
     }
-    if (normalized.includes('accuracy') || normalized.includes('completion') || normalized.includes('precision') || normalized.includes('recall') || normalized.includes('fscore')) {
+    if (normalized.includes('accuracy') || normalized.includes('completion') || normalized.includes('precision') || normalized.includes('recall') || normalized.includes('fscore') || /^f1([_.]|$)/.test(normalized)) {
         return 1;
     }
     return -1;
@@ -683,7 +683,9 @@ function metricLabel(category, key) {
 }
 
 function normalizeMetricLabel(label) {
-    const parts = String(label).split('.');
+    // Split on dots that are NOT part of decimal numbers (e.g. keep "0.05" intact).
+    // A decimal dot is preceded by a digit and followed by a digit.
+    const parts = String(label).split(/(?<!\d)\.(?!\d)/);
     return parts.map(normalizeMetricLabelPart).join(' / ');
 }
 
@@ -694,11 +696,22 @@ function normalizeMetricLabelPart(part) {
         return `${aucMatch[1].toUpperCase()}@${Number(aucMatch[2])}`;
     }
 
-    return compact
+    const pretty = compact
         .replace(/_/g, ' ')
         .replace(/\b\w/g, (letter) => letter.toUpperCase())
         .replace(/\b(Auc|Racc|Tacc)\s+(\d+)\b/g, (_, name, threshold) => `${name.toUpperCase()}@${Number(threshold)}`)
         .replace(/\b(Auc|Racc|Tacc)@(\d+)\b/g, (_, name, threshold) => `${name.toUpperCase()}@${Number(threshold)}`);
+
+    // Render threshold suffixes cleanly: "Precision 0.05" → "Precision@0.05 m"
+    const thresholdMatch = pretty.match(/^(.+?)\s+(\d+\.?\d*)$/);
+    if (thresholdMatch) {
+        const name = thresholdMatch[1];
+        const value = thresholdMatch[2];
+        if (/^(Precision|Recall|F1|Accuracy|Completeness|Chamfer)$/i.test(name)) {
+            return `${name}@${value} m`;
+        }
+    }
+    return pretty;
 }
 
 function categoryHint(category) {
