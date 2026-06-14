@@ -1,0 +1,13 @@
+dataset: scannet
+raw_data_root: /path/to/scannet
+_split: val
+sampling:
+  strategy: sequence
+  start_idx: 0
+  end_idx: -1
+  stride: 5
+evaluation:
+  depth:
+    gt_clip:
+      min: 0.5
+      max: 10.0

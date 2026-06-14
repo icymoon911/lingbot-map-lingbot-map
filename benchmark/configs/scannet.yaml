@@ -1,0 +1,23 @@
+# ScanNet v2 — lingbot_map trajectory + point-cloud evaluation.
+# Stride-5 sampling; see configs/datasets/scannet.yaml.
+workspace: /path/to/workspace/scannet
+
+datasets:
+  - scannet
+
+methods:
+  - lingbot_map
+
+evaluation:
+  traj:
+    enable: true
+    vis: true
+  auc:
+    enable: false
+  depth:
+    enable: false
+  points:
+    enable: true
+    vis: false
+    icp_threshold: 0.1
+    conf_threshold: 0.0

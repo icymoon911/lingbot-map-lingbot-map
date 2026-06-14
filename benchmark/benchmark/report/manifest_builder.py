@@ -51,7 +51,7 @@ class ManifestBuilder:
                 "version": "1",
                 "generated_at": datetime.now().isoformat(),
                 "datasets": [],
-                "metric_definitions": self._metric_definitions(),
+                "metric_definitions": {},
             }
         )
 
@@ -64,6 +64,11 @@ class ManifestBuilder:
             dataset_entry = self._build_dataset(dataset, plan, seen_copies)
             if dataset_entry is not None:
                 plan.manifest["datasets"].append(dataset_entry)
+
+        # Compute metric definitions after all datasets are processed so that
+        # threshold variants from multi-threshold point-cloud evaluations
+        # (e.g. ScanNet's 0.05m/0.10m) are discovered dynamically.
+        plan.manifest["metric_definitions"] = self._metric_definitions(plan)
 
         return plan
 
@@ -333,7 +338,7 @@ class ManifestBuilder:
                 datasets.append(item.name)
         return datasets
 
-    def _metric_definitions(self) -> dict[str, dict[str, str]]:
+    def _metric_definitions(self, plan: BuildPlan) -> dict[str, dict[str, str]]:
         definitions: dict[str, dict[str, str]] = {
             "traj.ate": {"label": "ATE", "direction": "lower"},
             "traj.rpe_trans": {"label": "RPE Trans", "direction": "lower"},
@@ -365,4 +370,29 @@ class ManifestBuilder:
                 "label": f"Tacc@{threshold}",
                 "direction": "higher",
             }
+
+        # Discover threshold variants from actual point-cloud evaluation data.
+        # When datasets use multiple thresholds (e.g. ScanNet: 0.05m and 0.10m),
+        # evaluate_pointcloud() emits keys like precision_0.05, recall_0.1, etc.
+        # We scan all accumulated method details to find these dynamically.
+        thresholds: set[str] = set()
+        for detail in plan.method_details.values():
+            points = detail.get("metrics", {}).get("points", {})
+            if isinstance(points, dict):
+                for key in points:
+                    if key.startswith("precision_"):
+                        thresholds.add(key[len("precision_"):])
+
+        for t in sorted(thresholds):
+            t_cm = f"{float(t) * 100:g}cm"
+            definitions[f"points.precision_{t}"] = {
+                "label": f"Precision@{t_cm}", "direction": "higher",
+            }
+            definitions[f"points.recall_{t}"] = {
+                "label": f"Recall@{t_cm}", "direction": "higher",
+            }
+            definitions[f"points.f1_{t}"] = {
+                "label": f"F1@{t_cm}", "direction": "higher",
+            }
+
         return definitions
