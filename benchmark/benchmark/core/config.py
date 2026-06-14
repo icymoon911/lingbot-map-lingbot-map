@@ -169,6 +169,7 @@ class ConfigManager:
         dataset_class_name = dataset_cfg.pop('dataset')
         sampling_config = dataset_cfg.pop('sampling', None)
         eval_override = dataset_cfg.pop('evaluation', {})
+        dataset_cfg.pop('scene_overrides', None)  # not a dataset param
 
         params = {}
         for key, value in dataset_cfg.items():
@@ -228,18 +229,22 @@ class ConfigManager:
         return self._base.get('evaluation', {})
 
     def get_merged_evaluation_config(
-        self, dataset_config_name: str, method_config_name: str = None
+        self, dataset_config_name: str, method_config_name: str = None,
+        scene_name: str = None,
     ) -> Dict[str, Any]:
-        """Get evaluation config merged for a specific dataset and method.
+        """Get evaluation config merged for a specific dataset, method, and scene.
 
         Merge order (later overrides earlier):
           1. base.yaml  evaluation  (global defaults)
           2. dataset yaml evaluation block
-          3. method yaml evaluation block
+          3. dataset yaml scene_overrides[scene_name].evaluation
+          4. method yaml evaluation block
 
         Args:
             dataset_config_name: Dataset config key (e.g., '7scenes_s10')
             method_config_name:  Optional method config key (e.g., 'slam3r')
+            scene_name:          Optional scene name for per-scene overrides.
+                                 Looks up ``scene_overrides`` in the dataset config.
 
         Returns:
             Merged evaluation config dict.
@@ -247,8 +252,16 @@ class ConfigManager:
         merged = dict(self._base.get('evaluation', {}))
 
         if dataset_config_name in self._datasets:
-            ds_eval = self._datasets[dataset_config_name].get('evaluation', {})
+            ds_cfg = self._datasets[dataset_config_name]
+            ds_eval = ds_cfg.get('evaluation', {})
             merged = _deep_merge(merged, ds_eval)
+
+            # Scene-level overrides
+            if scene_name:
+                scene_overrides = ds_cfg.get('scene_overrides', {})
+                if scene_name in scene_overrides:
+                    scene_eval = scene_overrides[scene_name].get('evaluation', {})
+                    merged = _deep_merge(merged, scene_eval)
 
         if method_config_name and method_config_name in self._methods:
             m_eval = self._methods[method_config_name].get('evaluation', {})

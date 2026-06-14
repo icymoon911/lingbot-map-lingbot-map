@@ -1,8 +1,10 @@
 """BSS (Benchmark Storage Structure) storage classes.
 
-Two-layer storage abstraction:
-  - BSSArtifact: single-directory path template (all fixed paths, completion, eval)
-  - BSSManager:  workspace-level navigation (hierarchy, scene/method listing)
+Three-layer storage abstraction:
+  - CompletionTracker: completion marker management (.complete.json)
+  - EvalStore:         evaluation result storage (eval/*.json)
+  - BSSArtifact:       single-directory path template (holds both above)
+  - BSSManager:        workspace-level navigation (hierarchy, scene/method listing)
 
 Layout:
     workspace/
@@ -32,65 +34,18 @@ def _json_default(obj):
     raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
 
 
-class BSSArtifact:
-    """Path template for a single BSS directory (gt or method output).
+class CompletionTracker:
+    """Manages completion markers (.complete.json) for a BSS directory.
 
-    All well-known paths are fixed properties defined at __init__ time,
-    making the complete layout inspectable and easy to modify in one place.
-
-    Layout:  workspace / {dataset} / {scene} / {gt|method} /
+    Responsible for:
+    - Writing / reading the ``.complete.json`` sentinel
+    - Tracking whether a directory has been fully populated
+    - Clearing incomplete directories
     """
 
     def __init__(self, root: Path):
         self.root = Path(root)
-
-        # ── frame data folders ────────────────────────────────────────────
-        self.rgb_dir        = self.root / 'rgb'
-        self.depth_dir      = self.root / 'depth'
-        self.points_dir     = self.root / 'points'
-        self.confidence_dir = self.root / 'confidence'
-        self.mask_dir       = self.root / 'mask'
-
-        # ── frame data files (stored as files, not folders) ───────────────
-        self.traj_file       = self.root / 'traj.txt'
-        self.intrinsics_file = self.root / 'intrinsics.txt'
-
-        # ── metadata / markers ────────────────────────────────────────────
         self.complete_file = self.root / '.complete.json'
-        self.sampling_file = self.root / 'sampling.json'
-
-        # ── method-level artifacts ────────────────────────────────────────
-        self.global_points_file  = self.root / 'points.ply'
-
-        # ── evaluation directory ──────────────────────────────────────────
-        self.eval_dir = self.root / 'eval'
-        self.traj_transform_file = self.eval_dir / 'traj_transform.txt'
-
-        # ── evaluation result files ───────────────────────────────────────
-        self.eval_traj_file   = self.eval_dir / 'traj.json'
-        self.eval_auc_file    = self.eval_dir / 'auc.json'
-        self.eval_depth_file  = self.eval_dir / 'depth.json'
-        self.eval_points_file = self.eval_dir / 'points.json'
-
-        # ── visualization directories ─────────────────────────────────────
-        # Internal filenames within these dirs are managed by the evaluators.
-        self.vis_traj_dir   = self.eval_dir / 'traj'
-        self.vis_auc_dir    = self.eval_dir / 'auc'
-        self.vis_depth_dir  = self.eval_dir / 'depth'
-        self.vis_points_dir = self.eval_dir / 'points'
-
-    # ── existence ─────────────────────────────────────────────────────────
-
-    def exists(self) -> bool:
-        return self.root.exists()
-
-    def has_frame_key(self, key: str) -> bool:
-        """Check whether a frame-level data key is present in this directory."""
-        if key == 'pose':       return self.traj_file.exists()
-        if key == 'intrinsics': return self.intrinsics_file.exists()
-        return (self.root / key).exists()
-
-    # ── completion management ─────────────────────────────────────────────
 
     def is_complete(self) -> bool:
         return self.complete_file.exists()
@@ -123,13 +78,19 @@ class BSSArtifact:
             shutil.rmtree(self.root)
             self.root.mkdir(parents=True, exist_ok=True)
 
-    def clear_directory(self) -> None:
-        """Remove all directory contents unconditionally (force mode)."""
-        if self.root.exists():
-            shutil.rmtree(self.root)
-        self.root.mkdir(parents=True, exist_ok=True)
 
-    # ── eval results ─────────────────────────────────────────────────────
+class EvalStore:
+    """Manages evaluation result storage (eval/*.json) for a BSS directory.
+
+    Responsible for:
+    - Saving / loading per-type evaluation JSON files
+    - Storing trajectory alignment transforms
+    - Managing the eval/ directory lifecycle
+    """
+
+    def __init__(self, eval_dir: Path):
+        self.eval_dir = Path(eval_dir)
+        self.traj_transform_file = self.eval_dir / 'traj_transform.txt'
 
     def has_eval(self, eval_type: str) -> bool:
         """Check if evaluation result exists for given type."""
@@ -164,6 +125,116 @@ class BSSArtifact:
                 'Apply as: p_aligned = T @ p_original (homogeneous coords)'
             )
         )
+
+
+class BSSArtifact:
+    """Path template for a single BSS directory (gt or method output).
+
+    All well-known paths are fixed properties defined at __init__ time,
+    making the complete layout inspectable and easy to modify in one place.
+
+    Holds a :class:`CompletionTracker` and :class:`EvalStore` instance,
+    delegating completion and eval operations to them respectively.
+
+    Layout:  workspace / {dataset} / {scene} / {gt|method} /
+    """
+
+    def __init__(self, root: Path):
+        self.root = Path(root)
+
+        # ── Delegated components ─────────────────────────────────────────
+        self.completion = CompletionTracker(self.root)
+        self.eval_store = EvalStore(self.root / 'eval')
+
+        # ── frame data folders ────────────────────────────────────────────
+        self.rgb_dir        = self.root / 'rgb'
+        self.depth_dir      = self.root / 'depth'
+        self.points_dir     = self.root / 'points'
+        self.confidence_dir = self.root / 'confidence'
+        self.mask_dir       = self.root / 'mask'
+
+        # ── frame data files (stored as files, not folders) ───────────────
+        self.traj_file       = self.root / 'traj.txt'
+        self.intrinsics_file = self.root / 'intrinsics.txt'
+
+        # ── metadata / markers ────────────────────────────────────────────
+        self.complete_file = self.completion.complete_file
+        self.sampling_file = self.root / 'sampling.json'
+
+        # ── method-level artifacts ────────────────────────────────────────
+        self.global_points_file  = self.root / 'points.ply'
+
+        # ── evaluation directory ──────────────────────────────────────────
+        self.eval_dir = self.eval_store.eval_dir
+        self.traj_transform_file = self.eval_store.traj_transform_file
+
+        # ── evaluation result files ───────────────────────────────────────
+        self.eval_traj_file   = self.eval_dir / 'traj.json'
+        self.eval_auc_file    = self.eval_dir / 'auc.json'
+        self.eval_depth_file  = self.eval_dir / 'depth.json'
+        self.eval_points_file = self.eval_dir / 'points.json'
+
+        # ── visualization directories ─────────────────────────────────────
+        # Internal filenames within these dirs are managed by the evaluators.
+        self.vis_traj_dir   = self.eval_dir / 'traj'
+        self.vis_auc_dir    = self.eval_dir / 'auc'
+        self.vis_depth_dir  = self.eval_dir / 'depth'
+        self.vis_points_dir = self.eval_dir / 'points'
+
+    # ── completion delegation ──────────────────────────────────────────
+
+    def is_complete(self) -> bool:
+        return self.completion.is_complete()
+
+    def mark_complete(self, metadata: dict = None) -> None:
+        self.completion.mark_complete(metadata)
+
+    def mark_incomplete(self) -> None:
+        self.completion.mark_incomplete()
+
+    def read_metadata(self) -> Optional[dict]:
+        return self.completion.read_metadata()
+
+    # ── eval delegation ────────────────────────────────────────────────
+
+    def has_eval(self, eval_type: str) -> bool:
+        return self.eval_store.has_eval(eval_type)
+
+    def save_eval(self, eval_type: str, results: dict) -> None:
+        self.eval_store.save_eval(eval_type, results)
+
+    def load_eval(self, eval_type: str) -> Optional[dict]:
+        return self.eval_store.load_eval(eval_type)
+
+    def clear_eval(self) -> None:
+        self.eval_store.clear_eval()
+
+    def save_traj_transform(self, T: np.ndarray) -> None:
+        self.eval_store.save_traj_transform(T)
+
+    # ── existence ─────────────────────────────────────────────────────────
+
+    def exists(self) -> bool:
+        return self.root.exists()
+
+    def has_frame_key(self, key: str) -> bool:
+        """Check whether a frame-level data key is present in this directory."""
+        if key == 'pose':       return self.traj_file.exists()
+        if key == 'intrinsics': return self.intrinsics_file.exists()
+        return (self.root / key).exists()
+
+    # ── directory management ──────────────────────────────────────────────
+
+    def clear_incomplete(self) -> None:
+        """Remove directory contents only if not yet marked complete."""
+        self.completion.clear_incomplete()
+
+    def clear_directory(self) -> None:
+        """Remove all directory contents unconditionally (force mode)."""
+        if self.root.exists():
+            shutil.rmtree(self.root)
+        self.root.mkdir(parents=True, exist_ok=True)
+
 
 class BSSManager:
     """Manages BSS hierarchy: workspace / dataset / scene / method.
