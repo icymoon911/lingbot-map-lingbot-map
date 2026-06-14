@@ -9,6 +9,8 @@ same resolution as the ground truth.
 """
 
 import cv2
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -23,6 +25,54 @@ from benchmark.utils.visualization import save_depth_visualization
 from benchmark.core.storage import BSSArtifact
 
 
+@dataclass(frozen=True)
+class _SpatialSaveConfig:
+    """Configuration for saving a single spatial data type."""
+    dir_attr: str           # BSSArtifact attribute name for the target directory
+    extension: str          # File extension including leading dot (e.g. '.png')
+    save_fn: Callable       # Callable(array, path) that writes the file
+    interpolation: int      # OpenCV interpolation flag for resize
+    generate_vis: bool = False  # Whether to also write a percentile-based JPG preview
+
+
+# Built-in spatial save configurations.
+# Custom types registered at runtime are merged into a copy of this dict.
+_BUILTIN_SPATIAL_SAVERS: Dict[str, _SpatialSaveConfig] = {
+    'rgb': _SpatialSaveConfig(
+        dir_attr='rgb_dir',
+        extension='.png',
+        save_fn=save_rgb,
+        interpolation=cv2.INTER_LINEAR,
+    ),
+    'depth': _SpatialSaveConfig(
+        dir_attr='depth_dir',
+        extension='.exr',
+        save_fn=save_exr,
+        interpolation=cv2.INTER_NEAREST,
+        generate_vis=True,
+    ),
+    'mask': _SpatialSaveConfig(
+        dir_attr='mask_dir',
+        extension='.png',
+        save_fn=save_mask,
+        interpolation=cv2.INTER_NEAREST,
+    ),
+    'confidence': _SpatialSaveConfig(
+        dir_attr='confidence_dir',
+        extension='.exr',
+        save_fn=save_exr,
+        interpolation=cv2.INTER_LINEAR,
+        generate_vis=True,
+    ),
+    'points': _SpatialSaveConfig(
+        dir_attr='points_dir',
+        extension='.exr',
+        save_fn=save_exr,
+        interpolation=cv2.INTER_NEAREST,
+    ),
+}
+
+
 class BSSSaver:
     """Manages saving of dataset/method frame and global data to BSS format.
 
@@ -32,6 +82,10 @@ class BSSSaver:
     All spatial per-frame outputs are resized to GT resolution (image_width x
     image_height passed to save_frame_data) before writing to disk, ensuring
     that stored files always match the ground truth image dimensions.
+
+    Built-in spatial types (rgb, depth, mask, confidence, points) and custom
+    types registered via ``register_spatial_saver`` share the same dispatch
+    mechanism through ``_save_spatial_data``.
     """
 
     # Built-in data types (handled natively, not via custom saver dispatch)
@@ -56,7 +110,10 @@ class BSSSaver:
         self.logger = logger
         self.artifact.root.mkdir(parents=True, exist_ok=True)
 
-        # Discovered custom saver methods on context
+        # Spatial save registry (built-in + any registered custom types)
+        self._spatial_savers: Dict[str, _SpatialSaveConfig] = dict(_BUILTIN_SPATIAL_SAVERS)
+
+        # Discovered custom saver methods on context (non-spatial, __save_X_file__ style)
         self.custom_savers: Dict[str, Callable] = {}
         if self.context is not None:
             self._discover_custom_savers()
@@ -81,6 +138,41 @@ class BSSSaver:
                 method = getattr(self.context, attr_name)
                 if callable(method):
                     self.custom_savers[key] = method
+
+    def register_spatial_saver(
+        self,
+        key: str,
+        dir_attr: str,
+        extension: str,
+        save_fn: Callable,
+        interpolation: int = cv2.INTER_LINEAR,
+        generate_vis: bool = False,
+    ) -> None:
+        """Register a custom spatial data type in the save registry.
+
+        Once registered, the type is dispatched through ``_save_spatial_data``
+        just like built-in types (rgb, depth, mask, confidence, points).
+
+        Args:
+            key:           Data type key (e.g. ``'semantic'``, ``'normal'``).
+            dir_attr:      BSSArtifact attribute name for the target directory
+                           (e.g. ``'depth_dir'``). If the attribute does not
+                           exist on the artifact, it is interpreted as a
+                           subdirectory name under ``artifact.root``.
+            extension:     File extension including leading dot (e.g. ``'.exr'``).
+            save_fn:       Callable(array, path) that writes a single frame file.
+            interpolation: OpenCV interpolation flag for resize.
+            generate_vis:  If True, also write a percentile-based JPG preview.
+        """
+        self._spatial_savers[key] = _SpatialSaveConfig(
+            dir_attr=dir_attr,
+            extension=extension,
+            save_fn=save_fn,
+            interpolation=interpolation,
+            generate_vis=generate_vis,
+        )
+        # Also add to BUILTIN_FRAME_TYPES so it's treated as a spatial key
+        self.BUILTIN_FRAME_TYPES = self.BUILTIN_FRAME_TYPES | {key}
 
     def get_completion_metadata(self) -> Dict[str, Any]:
         """Return metadata dict to be merged into .complete.json.
@@ -188,8 +280,8 @@ class BSSSaver:
         custom_keys: Set[str] = set()
 
         for frame_data in frame_data_list:
-            for key in ('rgb', 'depth', 'mask', 'confidence', 'points'):
-                if key in frame_data and frame_data[key] is not None:
+            for key in frame_data:
+                if key in self._spatial_savers and frame_data[key] is not None:
                     required_dirs.add(key)
 
             for key in frame_data.keys():
@@ -210,25 +302,14 @@ class BSSSaver:
         for idx, frame_data in enumerate(frame_data_list):
             frame_key = f"{idx:06d}"
 
-            if 'rgb' in frame_data and frame_data['rgb'] is not None:
-                save_tasks.append((self._save_rgb, (frame_key, frame_data['rgb'])))
-                self._frame_keys.add('rgb')
-
-            if 'depth' in frame_data and frame_data['depth'] is not None:
-                save_tasks.append((self._save_depth, (frame_key, frame_data['depth'])))
-                self._frame_keys.add('depth')
-
-            if 'points' in frame_data and frame_data['points'] is not None:
-                save_tasks.append((self._save_points, (frame_key, frame_data['points'])))
-                self._frame_keys.add('points')
-
-            if 'mask' in frame_data and frame_data['mask'] is not None:
-                save_tasks.append((self._save_mask, (frame_key, frame_data['mask'])))
-                self._frame_keys.add('mask')
-
-            if 'confidence' in frame_data and frame_data['confidence'] is not None:
-                save_tasks.append((self._save_confidence, (frame_key, frame_data['confidence'])))
-                self._frame_keys.add('confidence')
+            # Spatial types (built-in + registered custom)
+            for key in self._spatial_savers:
+                if key in frame_data and frame_data[key] is not None:
+                    # Capture current key and data via default args to avoid late-binding
+                    save_tasks.append(
+                        (self._save_spatial_data, (key, frame_key, frame_data[key]))
+                    )
+                    self._frame_keys.add(key)
 
             if 'pose' in frame_data:
                 poses_list[idx] = frame_data['pose']  # may be None
@@ -329,77 +410,47 @@ class BSSSaver:
     # Private save helpers
     # ------------------------------------------------------------------
 
-    def _save_rgb(self, base_name: str, rgb: np.ndarray) -> None:
-        """Save RGB image, resized to GT resolution."""
-        rgb = self._resize_to_gt(rgb, cv2.INTER_LINEAR)
-        rgb_file = self.artifact.rgb_dir / f"{base_name}.png"
-        save_rgb(rgb, rgb_file)
+    def _save_spatial_data(self, key: str, base_name: str, data: np.ndarray) -> None:
+        """Save a single frame of spatial data through the registry.
 
-    def _save_depth(self, base_name: str, depth: np.ndarray) -> None:
-        """Save depth map, resized to GT resolution with nearest-neighbor."""
-        if depth is None:
+        Both built-in types (rgb, depth, mask, confidence, points) and
+        registered custom types are dispatched here.
+
+        Args:
+            key:       Spatial data type key (must be in ``_spatial_savers``).
+            base_name: Zero-padded frame name (e.g. ``'000042'``).
+            data:      Numpy array to save.
+        """
+        if data is None:
             if self.logger:
-                self.logger.warning(f"Depth data for frame {base_name} is None, skipping save.")
+                self.logger.warning(f"{key} data for frame {base_name} is None, skipping save.")
             return
 
-        depth = self._resize_to_gt(depth, cv2.INTER_NEAREST)
-        depth_dir = self.artifact.depth_dir
-        depth_exr = depth_dir / f"{base_name}.exr"
-        save_exr(depth, depth_exr)
+        cfg = self._spatial_savers[key]
 
-        depth_jpg = depth_dir / f"{base_name}.jpg"
-        valid = (depth > 0) & np.isfinite(depth)
-        if np.any(valid):
-            min_d, max_d = np.percentile(depth[valid], [1, 99])
-            save_depth_visualization(depth, depth_jpg, min_d, max_d)
+        # Points has extra shape validation
+        if key == 'points':
+            if not isinstance(data, np.ndarray):
+                raise ValueError("Points must be a numpy array")
+            if data.ndim < 2 or data.shape[-1] != 3:
+                raise ValueError(f"Points must have shape [H, W, 3], got {data.shape}")
 
-    def _save_mask(self, base_name: str, mask: np.ndarray) -> None:
-        """Save mask image, resized to GT resolution with nearest-neighbor."""
-        if mask is None:
-            if self.logger:
-                self.logger.warning(f"Mask data for frame {base_name} is None, skipping save.")
-            return
+        data = self._resize_to_gt(data, cfg.interpolation)
+        # Resolve target directory: first try as a BSSArtifact attribute,
+        # then fall back to treating dir_attr as a subdirectory name under root.
+        target_dir = getattr(self.artifact, cfg.dir_attr, None)
+        if target_dir is None or not isinstance(target_dir, Path):
+            target_dir = self.artifact.root / cfg.dir_attr
+        target_dir.mkdir(parents=True, exist_ok=True)
+        file_path = target_dir / f"{base_name}{cfg.extension}"
+        cfg.save_fn(data, file_path)
 
-        mask = self._resize_to_gt(mask, cv2.INTER_NEAREST)
-        mask_file = self.artifact.mask_dir / f"{base_name}.png"
-        save_mask(mask, mask_file)
-
-    def _save_confidence(self, base_name: str, confidence: np.ndarray) -> None:
-        """Save confidence map as EXR, resized to GT resolution."""
-        if confidence is None:
-            if self.logger:
-                self.logger.warning(
-                    f"Confidence data for frame {base_name} is None, skipping save."
-                )
-            return
-
-        confidence = self._resize_to_gt(confidence, cv2.INTER_LINEAR)
-        conf_dir = self.artifact.confidence_dir
-        conf_file = conf_dir / f"{base_name}.exr"
-        save_exr(confidence, conf_file)
-
-        conf_jpg = conf_dir / f"{base_name}.jpg"
-        valid = (confidence > 0) & np.isfinite(confidence)
-        if np.any(valid):
-            min_c, max_c = np.percentile(confidence[valid], [1, 99])
-            save_depth_visualization(confidence, conf_jpg, min_c, max_c)
-
-    def _save_points(self, base_name: str, points: np.ndarray) -> None:
-        """Save per-frame world-coordinate point grid as EXR, resized to GT resolution."""
-        if points is None:
-            if self.logger:
-                self.logger.warning(f"Points data for frame {base_name} is None, skipping save.")
-            return
-
-        if not isinstance(points, np.ndarray):
-            raise ValueError("Points must be a numpy array")
-
-        if points.ndim < 2 or points.shape[-1] != 3:
-            raise ValueError(f"Points must have shape [H, W, 3], got {points.shape}")
-
-        points = self._resize_to_gt(points, cv2.INTER_NEAREST)
-        points_file = self.artifact.points_dir / f"{base_name}.exr"
-        save_exr(points, points_file)
+        if cfg.generate_vis:
+            vis_path = target_dir / f"{base_name}.jpg"
+            valid = (data > 0) & np.isfinite(data)
+            if np.any(valid):
+                min_v, max_v = np.percentile(data[valid], [1, 99])
+                save_depth_visualization(data, vis_path, min_v, max_v)
 
     def _save_pointcloud(self, points: np.ndarray) -> None:
         """Save global point cloud."""

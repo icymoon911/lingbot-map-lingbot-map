@@ -1,8 +1,11 @@
 """BSS (Benchmark Storage Structure) storage classes.
 
-Two-layer storage abstraction:
-  - BSSArtifact: single-directory path template (all fixed paths, completion, eval)
-  - BSSManager:  workspace-level navigation (hierarchy, scene/method listing)
+Three-layer storage abstraction:
+  - CompletionTracker: manages the .complete.json marker file
+  - EvalStore:         manages the eval/ directory (results + traj transform)
+  - BSSArtifact:       single-directory path template; holds a CompletionTracker
+                       and an EvalStore, plus all well-known paths
+  - BSSManager:        workspace-level navigation (hierarchy, scene/method listing)
 
 Layout:
     workspace/
@@ -32,11 +35,135 @@ def _json_default(obj):
     raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
 
 
+class CompletionTracker:
+    """Manages the .complete.json marker file for a BSS directory.
+
+    Responsible for:
+      - Writing / removing the marker file
+      - Reading back the embedded metadata dict
+      - Clearing directory contents when the run was incomplete
+    """
+
+    def __init__(self, complete_file: Path, root: Path):
+        """Initialize completion tracker.
+
+        Args:
+            complete_file: Path to the .complete.json marker
+            root:          Root directory of the BSS artifact
+        """
+        self._complete_file = complete_file
+        self._root = root
+
+    @property
+    def complete_file(self) -> Path:
+        return self._complete_file
+
+    def is_complete(self) -> bool:
+        return self._complete_file.exists()
+
+    def mark_complete(self, metadata: dict = None) -> None:
+        self._root.mkdir(parents=True, exist_ok=True)
+        data = {
+            "completed_at": datetime.now().isoformat(),
+            "metadata": metadata or {}
+        }
+        with open(self._complete_file, 'w') as f:
+            json.dump(data, f, indent=2)
+
+    def mark_incomplete(self) -> None:
+        if self._complete_file.exists():
+            self._complete_file.unlink()
+
+    def read_metadata(self) -> Optional[dict]:
+        if not self._complete_file.exists():
+            return None
+        try:
+            with open(self._complete_file) as f:
+                return json.load(f).get("metadata", {})
+        except (json.JSONDecodeError, IOError):
+            return None
+
+    def clear_incomplete(self) -> None:
+        """Remove directory contents only if not yet marked complete."""
+        if self._root.exists() and not self.is_complete():
+            shutil.rmtree(self._root)
+            self._root.mkdir(parents=True, exist_ok=True)
+
+
+class EvalStore:
+    """Manages the eval/ directory within a BSS artifact.
+
+    Responsible for:
+      - Saving / loading per-type evaluation JSON results
+      - Saving the Sim(3) trajectory alignment transform
+      - Clearing the entire eval/ directory
+    """
+
+    def __init__(self, eval_dir: Path, traj_transform_file: Path):
+        """Initialize eval store.
+
+        Args:
+            eval_dir:            Path to the eval/ directory
+            traj_transform_file: Path to eval/traj_transform.txt
+        """
+        self._eval_dir = eval_dir
+        self._traj_transform_file = traj_transform_file
+
+    @property
+    def eval_dir(self) -> Path:
+        return self._eval_dir
+
+    @property
+    def traj_transform_file(self) -> Path:
+        return self._traj_transform_file
+
+    def has_eval(self, eval_type: str) -> bool:
+        """Check if evaluation result exists for given type."""
+        return (self._eval_dir / f'{eval_type}.json').exists()
+
+    def save_eval(self, eval_type: str, results: dict) -> None:
+        """Save evaluation results to eval/{eval_type}.json."""
+        self._eval_dir.mkdir(parents=True, exist_ok=True)
+        filepath = self._eval_dir / f'{eval_type}.json'
+        with open(filepath, 'w') as f:
+            json.dump(results, f, indent=2, sort_keys=True, default=_json_default)
+
+    def load_eval(self, eval_type: str) -> Optional[dict]:
+        """Load evaluation results from eval/{eval_type}.json. Returns None if not found."""
+        filepath = self._eval_dir / f'{eval_type}.json'
+        if not filepath.exists():
+            return None
+        with open(filepath) as f:
+            return json.load(f)
+
+    def clear_eval(self) -> None:
+        """Delete entire eval/ directory."""
+        if self._eval_dir.exists():
+            shutil.rmtree(self._eval_dir)
+
+    def save_traj_transform(self, T: np.ndarray) -> None:
+        self._eval_dir.mkdir(parents=True, exist_ok=True)
+        np.savetxt(
+            self._traj_transform_file, T, fmt='%.10f',
+            header=(
+                '4x4 Sim(3) alignment transformation matrix\n'
+                'Apply as: p_aligned = T @ p_original (homogeneous coords)'
+            )
+        )
+
+
 class BSSArtifact:
     """Path template for a single BSS directory (gt or method output).
 
     All well-known paths are fixed properties defined at __init__ time,
     making the complete layout inspectable and easy to modify in one place.
+
+    Composition:
+      - ``completion``: CompletionTracker for the .complete.json marker
+      - ``eval_store``: EvalStore for the eval/ directory
+
+    All tracker/store operations are also exposed as direct methods on the
+    artifact for backward compatibility.
 
     Layout:  workspace / {dataset} / {scene} / {gt|method} /
     """
@@ -79,6 +206,10 @@ class BSSArtifact:
         self.vis_depth_dir  = self.eval_dir / 'depth'
         self.vis_points_dir = self.eval_dir / 'points'
 
+        # ── composed helpers ──────────────────────────────────────────────
+        self.completion = CompletionTracker(self.complete_file, self.root)
+        self.eval_store = EvalStore(self.eval_dir, self.traj_transform_file)
+
     # ── existence ─────────────────────────────────────────────────────────
 
     def exists(self) -> bool:
@@ -90,38 +221,23 @@ class BSSArtifact:
         if key == 'intrinsics': return self.intrinsics_file.exists()
         return (self.root / key).exists()
 
-    # ── completion management ─────────────────────────────────────────────
+    # ── completion management (delegated to CompletionTracker) ────────────
 
     def is_complete(self) -> bool:
-        return self.complete_file.exists()
+        return self.completion.is_complete()
 
     def mark_complete(self, metadata: dict = None) -> None:
-        self.root.mkdir(parents=True, exist_ok=True)
-        data = {
-            "completed_at": datetime.now().isoformat(),
-            "metadata": metadata or {}
-        }
-        with open(self.complete_file, 'w') as f:
-            json.dump(data, f, indent=2)
+        self.completion.mark_complete(metadata)
 
     def mark_incomplete(self) -> None:
-        if self.complete_file.exists():
-            self.complete_file.unlink()
+        self.completion.mark_incomplete()
 
     def read_metadata(self) -> Optional[dict]:
-        if not self.complete_file.exists():
-            return None
-        try:
-            with open(self.complete_file) as f:
-                return json.load(f).get("metadata", {})
-        except (json.JSONDecodeError, IOError):
-            return None
+        return self.completion.read_metadata()
 
     def clear_incomplete(self) -> None:
         """Remove directory contents only if not yet marked complete."""
-        if self.root.exists() and not self.is_complete():
-            shutil.rmtree(self.root)
-            self.root.mkdir(parents=True, exist_ok=True)
+        self.completion.clear_incomplete()
 
     def clear_directory(self) -> None:
         """Remove all directory contents unconditionally (force mode)."""
@@ -129,41 +245,27 @@ class BSSArtifact:
             shutil.rmtree(self.root)
         self.root.mkdir(parents=True, exist_ok=True)
 
-    # ── eval results ─────────────────────────────────────────────────────
+    # ── eval results (delegated to EvalStore) ─────────────────────────────
 
     def has_eval(self, eval_type: str) -> bool:
         """Check if evaluation result exists for given type."""
-        return (self.eval_dir / f'{eval_type}.json').exists()
+        return self.eval_store.has_eval(eval_type)
 
     def save_eval(self, eval_type: str, results: dict) -> None:
         """Save evaluation results to eval/{eval_type}.json."""
-        self.eval_dir.mkdir(parents=True, exist_ok=True)
-        filepath = self.eval_dir / f'{eval_type}.json'
-        with open(filepath, 'w') as f:
-            json.dump(results, f, indent=2, sort_keys=True, default=_json_default)
+        self.eval_store.save_eval(eval_type, results)
 
     def load_eval(self, eval_type: str) -> Optional[dict]:
         """Load evaluation results from eval/{eval_type}.json. Returns None if not found."""
-        filepath = self.eval_dir / f'{eval_type}.json'
-        if not filepath.exists():
-            return None
-        with open(filepath) as f:
-            return json.load(f)
+        return self.eval_store.load_eval(eval_type)
 
     def clear_eval(self) -> None:
         """Delete entire eval/ directory."""
-        if self.eval_dir.exists():
-            shutil.rmtree(self.eval_dir)
+        self.eval_store.clear_eval()
 
     def save_traj_transform(self, T: np.ndarray) -> None:
-        self.eval_dir.mkdir(parents=True, exist_ok=True)
-        np.savetxt(
-            self.traj_transform_file, T, fmt='%.10f',
-            header=(
-                '4x4 Sim(3) alignment transformation matrix\n'
-                'Apply as: p_aligned = T @ p_original (homogeneous coords)'
-            )
-        )
+        self.eval_store.save_traj_transform(T)
+
 
 class BSSManager:
     """Manages BSS hierarchy: workspace / dataset / scene / method.

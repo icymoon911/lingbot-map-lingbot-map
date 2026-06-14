@@ -9,14 +9,15 @@ import matplotlib.pyplot as plt
 
 from benchmark.geometry.transform import invert_transform
 from benchmark.geometry.quaternion import rotation_matrix_to_quaternion
-from benchmark.evaluation.trajectory import _filter_valid_pose_pairs
+from benchmark.core.trajectory_utils import filter_valid_pose_pairs
+from benchmark.evaluation.base import BaseTrajectoryEvaluator
 
 
 # AUC evaluation thresholds (degrees)
 DEFAULT_AUC_THRESHOLDS = [3, 5, 15, 30]
 
 
-class AUCEvaluator:
+class AUCEvaluator(BaseTrajectoryEvaluator):
     """Evaluates camera pose accuracy using AUC metrics."""
 
     def __init__(self, thresholds: List[int] = None):
@@ -27,53 +28,22 @@ class AUCEvaluator:
         """
         self.thresholds = thresholds if thresholds else DEFAULT_AUC_THRESHOLDS
 
-    def evaluate(self, gt_loader, pred_loader,
-                 logger: Optional[logging.Logger] = None) -> Dict[str, float]:
+    def _compute_metrics(
+        self,
+        prepared,
+        gt_loader,
+        pred_loader,
+        logger: logging.Logger,
+    ) -> Dict[str, float]:
         """Compute pose AUC metrics for a scene.
-
-        Args:
-            gt_loader:   BSSLoader for ground truth directory
-            pred_loader: BSSLoader for predicted directory
-            logger:      Optional logger
 
         Returns:
             Dictionary containing AUC metrics:
             - 'AUC_03', 'AUC_05', 'AUC_15', 'AUC_30': AUC at different thresholds
             - 'Racc_03', 'Racc_05', 'Racc_15', 'Racc_30': Rotation accuracy
             - 'Tacc_03', 'Tacc_05', 'Tacc_15', 'Tacc_30': Translation accuracy
-
-        Raises:
-            ValueError: If no valid pose pairs found
         """
-        if logger is None:
-            logging.basicConfig(
-                level=logging.INFO,
-                format="%(asctime)s - %(levelname)s - %(message)s",
-                datefmt="%H:%M:%S",
-            )
-            logger = logging.getLogger(__name__)
-
-        gt_traj = gt_loader.load_trajectory()
-        pred_traj = pred_loader.load_trajectory()
-
-        if gt_traj is None:
-            raise FileNotFoundError(f"GT trajectory not found: {gt_loader.artifact.traj_file}")
-        if pred_traj is None:
-            raise FileNotFoundError(f"Predicted trajectory not found: {pred_loader.artifact.traj_file}")
-
-        # Use frame_index_map to select matching GT poses for sparse SLAM outputs.
-        # For dense methods the map is identity [0, 1, ..., N-1].
-        pred_frame_indices = pred_loader.get_frame_indices()
-        gt_poses   = gt_traj[pred_frame_indices]  # (K, 4, 4)
-        pred_poses = pred_traj                    # (K, 4, 4), always dense/valid
-        num_frames = len(pred_frame_indices)
-
-        if num_frames == 0:
-            raise ValueError("Empty trajectory — no frames to evaluate")
-
-        timestamps_float = np.array(pred_frame_indices, dtype=float)
-        gt_poses, pred_poses, timestamps_float = _filter_valid_pose_pairs(
-            gt_poses, pred_poses, timestamps_float, logger)
+        _, _, gt_poses, pred_poses, timestamps_float, pred_frame_indices = prepared
         num_frames = len(gt_poses)
 
         # C2W → W2C: use np.linalg.inv for proper inverse of non-orthogonal R
@@ -196,13 +166,7 @@ class AUCEvaluator:
         Returns:
             Tuple of (frame_counts, auc_values, racc_values, tacc_values)
         """
-        if logger is None:
-            logging.basicConfig(
-                level=logging.INFO,
-                format="%(asctime)s - %(levelname)s - %(message)s",
-                datefmt="%H:%M:%S",
-            )
-            logger = logging.getLogger(__name__)
+        logger = self._ensure_logger(logger)
 
         gt_traj = gt_loader.load_trajectory()
         pred_traj = pred_loader.load_trajectory()
@@ -213,7 +177,7 @@ class AUCEvaluator:
             raise FileNotFoundError(f"Predicted trajectory not found: {pred_loader.artifact.traj_file}")
 
         pred_frame_indices = pred_loader.get_frame_indices()
-        gt_poses   = gt_traj[pred_frame_indices]
+        gt_poses = gt_traj[pred_frame_indices]
         pred_poses = pred_traj
         num_frames = len(pred_frame_indices)
 
@@ -221,7 +185,7 @@ class AUCEvaluator:
             raise ValueError("Empty trajectory — no frames to evaluate")
 
         timestamps_float = np.array(pred_frame_indices, dtype=float)
-        gt_poses, pred_poses, timestamps_float = _filter_valid_pose_pairs(
+        gt_poses, pred_poses, timestamps_float = filter_valid_pose_pairs(
             gt_poses, pred_poses, timestamps_float, logger)
         num_frames = len(gt_poses)
 

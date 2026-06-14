@@ -6,6 +6,8 @@ from pathlib import Path
 from scipy.spatial import cKDTree as KDTree
 from typing import Dict, List, Optional, Tuple
 
+from benchmark.evaluation.base import BaseEvaluator
+
 
 def distance(
     source_points: np.ndarray,
@@ -422,7 +424,7 @@ def plot_pr_curve(
     plt.close(fig)
 
 
-class PointCloudEvaluator:
+class PointCloudEvaluator(BaseEvaluator):
     """Wraps dataset.evaluate_pointcloud() as a uniform evaluator."""
 
     def __init__(self, dataset, options: dict = None):

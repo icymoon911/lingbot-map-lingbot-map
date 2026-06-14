@@ -4,7 +4,7 @@ Provides utilities to load data from standardized BSS format directories.
 """
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 import cv2
 
@@ -19,6 +19,10 @@ from benchmark.geometry.resize import (
 )
 
 DEFAULT_CONFIDENCE_VALUE = -1.0
+
+# Sentinel for the two supported resize strategies
+_RESIZE_LINEAR = 'linear'
+_RESIZE_NEAREST = 'nearest'
 
 
 class BSSLoader:
@@ -166,6 +170,78 @@ class BSSLoader:
         return key in metadata.get('global_keys', [])
 
     # ------------------------------------------------------------------
+    # Generic frame-list loader
+    # ------------------------------------------------------------------
+
+    def _load_frame_list(
+        self,
+        directory: Path,
+        extension: str,
+        load_fn: Callable[[Path], np.ndarray],
+        resize_mode: str = _RESIZE_LINEAR,
+        post_process: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+        raise_on_missing_dir: bool = True,
+    ) -> Optional[List[Optional[np.ndarray]]]:
+        """Load a per-frame data list from a BSS subdirectory.
+
+        Generic helper that all ``load_X_list`` methods delegate to.  Handles
+        directory existence checks, per-frame file loading, optional resizing,
+        and optional post-processing in a single place.
+
+        Args:
+            directory:          Subdirectory containing the frame files.
+            extension:          File extension including the leading dot
+                                (e.g. ``'.png'``, ``'.exr'``).
+            load_fn:            Callable that reads a single file path and returns
+                                a numpy array.
+            resize_mode:        ``'linear'`` for bilinear interpolation,
+                                ``'nearest'`` for nearest-neighbour (labels, masks,
+                                depth, points).
+            post_process:       Optional transform applied to the loaded (and
+                                optionally resized) array before it is appended to
+                                the result list.
+            raise_on_missing_dir: If True, raises FileNotFoundError when the
+                                directory does not exist.  If False, returns None.
+
+        Returns:
+            List of length N (one entry per frame); entries are numpy arrays or
+            None when the per-frame file is absent.  Returns None when the
+            directory itself does not exist and ``raise_on_missing_dir`` is False.
+
+        Raises:
+            FileNotFoundError: If ``directory`` does not exist and
+                ``raise_on_missing_dir`` is True.
+        """
+        if not directory.exists():
+            if raise_on_missing_dir:
+                raise FileNotFoundError(f"Directory not found: {directory}")
+            return None
+
+        N = self.get_num_frames()
+        result: List[Optional[np.ndarray]] = []
+
+        for idx in range(N):
+            file_path = directory / f"{idx:06d}{extension}"
+            if not file_path.exists():
+                result.append(None)
+                continue
+
+            data = load_fn(file_path)
+
+            if self.resize_context and self.resize_context.enabled:
+                if resize_mode == _RESIZE_NEAREST:
+                    data = self.resize_context.apply_nearest(data)
+                else:
+                    data = self.resize_context.apply(data, cv2.INTER_LINEAR)
+
+            if post_process is not None:
+                data = post_process(data)
+
+            result.append(data)
+
+        return result
+
+    # ------------------------------------------------------------------
     # Image loading
     # ------------------------------------------------------------------
 
@@ -182,26 +258,13 @@ class BSSLoader:
         Raises:
             FileNotFoundError: If the RGB directory itself does not exist.
         """
-        N = self.get_num_frames()
-        rgb_dir = self.artifact.rgb_dir
-
-        if not rgb_dir.exists():
-            raise FileNotFoundError(f"RGB directory not found: {rgb_dir}")
-
-        rgb_list = []
-        for idx in range(N):
-            rgb_file = rgb_dir / f"{idx:06d}.png"
-            if not rgb_file.exists():
-                rgb_list.append(None)
-                continue
-            rgb = load_rgb(rgb_file)
-
-            if self.resize_context and self.resize_context.enabled:
-                rgb = self.resize_context.apply(rgb, cv2.INTER_LINEAR)
-
-            rgb_list.append(rgb)
-
-        return rgb_list
+        return self._load_frame_list(
+            directory=self.artifact.rgb_dir,
+            extension='.png',
+            load_fn=load_rgb,
+            resize_mode=_RESIZE_LINEAR,
+            raise_on_missing_dir=True,
+        )
 
     def load_depth_list(self) -> Optional[List[Optional[np.ndarray]]]:
         """Load all depth maps in frame index order.
@@ -211,26 +274,13 @@ class BSSLoader:
             Individual entries may be None if the file is missing for that frame.
             Returns None if depth directory does not exist.
         """
-        depth_dir = self.artifact.depth_dir
-        if not depth_dir.exists():
-            return None
-
-        N = self.get_num_frames()
-        depth_list = []
-
-        for idx in range(N):
-            depth_file = depth_dir / f"{idx:06d}.exr"
-            if depth_file.exists():
-                depth = load_exr(depth_file)
-
-                if self.resize_context and self.resize_context.enabled:
-                    depth = self.resize_context.apply_nearest(depth)
-
-                depth_list.append(depth)
-            else:
-                depth_list.append(None)
-
-        return depth_list
+        return self._load_frame_list(
+            directory=self.artifact.depth_dir,
+            extension='.exr',
+            load_fn=load_exr,
+            resize_mode=_RESIZE_NEAREST,
+            raise_on_missing_dir=False,
+        )
 
     def load_points_list(self) -> Optional[List[Optional[np.ndarray]]]:
         """Load all point cloud maps in frame index order.
@@ -238,26 +288,13 @@ class BSSLoader:
         Returns:
             List of HxWx3 or HxWx6 point cloud maps (float32), or None if not available
         """
-        point_dir = self.artifact.points_dir
-        if not point_dir.exists():
-            return None
-
-        N = self.get_num_frames()
-        point_list = []
-
-        for idx in range(N):
-            point_file = point_dir / f"{idx:06d}.exr"
-            if point_file.exists():
-                points = load_exr(point_file)
-
-                if self.resize_context and self.resize_context.enabled:
-                    points = self.resize_context.apply_nearest(points)
-
-                point_list.append(points)
-            else:
-                point_list.append(None)
-
-        return point_list
+        return self._load_frame_list(
+            directory=self.artifact.points_dir,
+            extension='.exr',
+            load_fn=load_exr,
+            resize_mode=_RESIZE_NEAREST,
+            raise_on_missing_dir=False,
+        )
 
     def load_confidence_list(self) -> Optional[List[Optional[np.ndarray]]]:
         """Load all confidence maps in frame index order.
@@ -267,26 +304,13 @@ class BSSLoader:
             Individual entries may be None if the file is missing for that frame.
             Returns None if confidence directory does not exist.
         """
-        conf_dir = self.artifact.confidence_dir
-        if not conf_dir.exists():
-            return None
-
-        N = self.get_num_frames()
-        conf_list = []
-
-        for idx in range(N):
-            conf_file = conf_dir / f"{idx:06d}.exr"
-            if conf_file.exists():
-                conf = load_exr(conf_file)
-
-                if self.resize_context and self.resize_context.enabled:
-                    conf = self.resize_context.apply(conf, cv2.INTER_LINEAR)
-
-                conf_list.append(conf)
-            else:
-                conf_list.append(None)
-
-        return conf_list
+        return self._load_frame_list(
+            directory=self.artifact.confidence_dir,
+            extension='.exr',
+            load_fn=load_exr,
+            resize_mode=_RESIZE_LINEAR,
+            raise_on_missing_dir=False,
+        )
 
     def load_mask_list(self) -> Optional[List[Optional[np.ndarray]]]:
         """Load all mask images in frame index order.
@@ -294,29 +318,22 @@ class BSSLoader:
         Returns:
             List of HxW mask arrays (bool), or None if not available
         """
-        mask_dir = self.artifact.mask_dir
-        if not mask_dir.exists():
-            return None
+        def _load_mask_file(path: Path) -> np.ndarray:
+            mask = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+            return mask.astype(bool)
 
-        N = self.get_num_frames()
-        mask_list = []
+        def _post_process_mask(mask: np.ndarray) -> np.ndarray:
+            # Re-threshold after resize to ensure boolean values
+            return mask > 0
 
-        for idx in range(N):
-            mask_file = mask_dir / f"{idx:06d}.png"
-            if mask_file.exists():
-                mask = cv2.imread(str(mask_file), cv2.IMREAD_GRAYSCALE)
-                mask = mask.astype(bool)
-
-                if self.resize_context and self.resize_context.enabled:
-                    mask_uint8 = mask.astype(np.uint8) * 255
-                    mask_uint8 = self.resize_context.apply_nearest(mask_uint8)
-                    mask = mask_uint8.astype(bool)
-
-                mask_list.append(mask)
-            else:
-                mask_list.append(None)
-
-        return mask_list
+        return self._load_frame_list(
+            directory=self.artifact.mask_dir,
+            extension='.png',
+            load_fn=_load_mask_file,
+            resize_mode=_RESIZE_NEAREST,
+            post_process=_post_process_mask,
+            raise_on_missing_dir=False,
+        )
 
     # ------------------------------------------------------------------
     # Trajectory / intrinsics
@@ -521,7 +538,7 @@ class BSSLoader:
                         f"RGB shape {rgb.shape[:2]} doesn't match depth shape {(H, W)}"
                     )
                 xyzrgb[i, :, :, 3:] = rgb.astype(np.float32) / 255.0
-        
+
         # Apply global thresholding if confidence_threshold > 0.0
         if confidence_threshold > 0.0:
             conf_list = self.load_confidence_list()

@@ -223,7 +223,9 @@ def main():
                     logger.info(f"Evaluating scene ({scene_idx}/{len(scenes)}): {scene}")
                     evaluator = Evaluator(
                         gt_artifact, pred_artifact,
-                        config_manager.get_merged_evaluation_config(dataset_name, method_name),
+                        config_manager.get_merged_evaluation_config(
+                            dataset_name, method_name, scene_name=scene
+                        ),
                         logger, dataset=dataset, force=args.force
                     )
                     evaluator.evaluate()

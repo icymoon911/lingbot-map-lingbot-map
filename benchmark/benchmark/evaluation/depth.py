@@ -9,9 +9,10 @@ import numpy as np
 import cv2
 
 from benchmark.core.loader import BSSLoader
+from benchmark.evaluation.base import BaseEvaluator
 
 
-class DepthEvaluator:
+class DepthEvaluator(BaseEvaluator):
     """Evaluates depth prediction quality using standard metrics.
 
     Computes metrics like absolute relative error, RMSE, and delta accuracies
