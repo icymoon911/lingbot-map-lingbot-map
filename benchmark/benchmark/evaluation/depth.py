@@ -159,7 +159,15 @@ class DepthEvaluator:
             Returns (None, None) if frame is invalid
         """
         gt_min, gt_max = self.gt_clip
-        valid_mask = (gt_depth > gt_min) & (gt_depth < gt_max)
+        # Enforce a strict positive lower bound so that ``np.abs(pred - gt) / gt``
+        # in ``_compute_metrics`` never divides by zero or a near-zero value.
+        # The default gt_clip lower bound is 0 which lets through tiny positive
+        # values (e.g. 1e-10) whose reciprocals blow up to inf and poison the
+        # entire per-frame metric with NaN.  We floor the effective lower bound
+        # at 1e-3 m (1 mm) which is below any physically meaningful depth.
+        _GT_EPS = 1e-3
+        effective_gt_min = max(gt_min, _GT_EPS)
+        valid_mask = (gt_depth > effective_gt_min) & (gt_depth < gt_max)
         valid_mask = valid_mask & np.isfinite(gt_depth) & np.isfinite(pred_depth)
         valid_mask = valid_mask & (pred_depth > 0)
 
@@ -202,19 +210,31 @@ class DepthEvaluator:
 
     @staticmethod
     def _align_scale_only(pred: np.ndarray, gt: np.ndarray) -> float:
-        """Compute scale using median ratio."""
-        return np.median(gt) / np.median(pred)
+        """Compute scale using median ratio.
+
+        Returns 1.0 when the pred median is effectively zero to avoid inf.
+        """
+        med_pred = np.median(pred)
+        med_gt = np.median(gt)
+        if abs(float(med_pred)) < 1e-12:
+            return 1.0
+        return float(med_gt / med_pred)
 
     @staticmethod
     def _compute_metrics(pred: np.ndarray, gt: np.ndarray) -> Dict[str, float]:
         """Compute depth metrics on concatenated valid pixels."""
-        abs_rel = np.mean(np.abs(pred - gt) / gt)
-        sq_rel = np.mean((pred - gt) ** 2 / gt)
-        rmse = np.sqrt(np.mean((pred - gt) ** 2))
+        # Defense-in-depth: floor gt at a small positive epsilon so that a
+        # caller which forgets the lower-bound filter cannot produce inf/NaN
+        # from ``/ gt``.  The evaluate_single_frame valid_mask already excludes
+        # gt < 1e-3, so this clip should never activate in practice.
+        gt_safe = np.clip(gt, 1e-3, None)
+        abs_rel = np.mean(np.abs(pred - gt_safe) / gt_safe)
+        sq_rel = np.mean((pred - gt_safe) ** 2 / gt_safe)
+        rmse = np.sqrt(np.mean((pred - gt_safe) ** 2))
         pred_clipped = np.clip(pred, 1e-5, None)
-        gt_clipped = np.clip(gt, 1e-5, None)
+        gt_clipped = np.clip(gt_safe, 1e-5, None)
         log_rmse = np.sqrt(np.mean((np.log(pred_clipped) - np.log(gt_clipped)) ** 2))
-        max_ratio = np.maximum(pred / gt, gt / pred)
+        max_ratio = np.maximum(pred_clipped / gt_clipped, gt_clipped / pred_clipped)
         delta_1_25 = np.mean((max_ratio < 1.25).astype(float)) * 100
         delta_1_25_2 = np.mean((max_ratio < 1.5625).astype(float)) * 100
         delta_1_25_3 = np.mean((max_ratio < 1.953125).astype(float)) * 100

@@ -351,6 +351,11 @@ class BSSSaver:
         valid = (depth > 0) & np.isfinite(depth)
         if np.any(valid):
             min_d, max_d = np.percentile(depth[valid], [1, 99])
+            # Widen a degenerate range so the colormap normalization does not
+            # silently produce a flat-colour image when all valid pixels share
+            # the same depth (min_d == max_d).
+            if max_d - min_d < 1e-6:
+                max_d = min_d + 1.0
             save_depth_visualization(depth, depth_jpg, min_d, max_d)
 
     def _save_mask(self, base_name: str, mask: np.ndarray) -> None:
@@ -378,10 +383,17 @@ class BSSSaver:
         conf_file = conf_dir / f"{base_name}.exr"
         save_exr(confidence, conf_file)
 
+        # Guard against all-zero / all-NaN confidence where ``valid`` is empty —
+        # np.percentile on an empty array raises, so skip the JPG in that case.
         conf_jpg = conf_dir / f"{base_name}.jpg"
         valid = (confidence > 0) & np.isfinite(confidence)
         if np.any(valid):
             min_c, max_c = np.percentile(confidence[valid], [1, 99])
+            # Widen a degenerate range so visualize_depth_colormap does not
+            # silently produce a flat-colour image when all valid pixels share
+            # the same value (min_c == max_c).
+            if max_c - min_c < 1e-6:
+                max_c = min_c + 1.0
             save_depth_visualization(confidence, conf_jpg, min_c, max_c)
 
     def _save_points(self, base_name: str, points: np.ndarray) -> None:

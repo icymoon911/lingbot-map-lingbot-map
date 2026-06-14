@@ -15,17 +15,32 @@ from benchmark.evaluation.trajectory import _filter_valid_pose_pairs
 # AUC evaluation thresholds (degrees)
 DEFAULT_AUC_THRESHOLDS = [3, 5, 15, 30]
 
+# When num_frames exceeds this threshold, pair indices are sampled rather than
+# exhaustively enumerated.  Full enumeration builds N*(N-1)/2 pairs which OOMs
+# around N=3000 (oxford_long stride-1 scenes can exceed 3000 frames).
+PAIR_SAMPLING_THRESHOLD = 500
+# Maximum number of pairs to sample when above the threshold.  500k pairs is
+# plenty for a stable AUC estimate while staying well within memory budget.
+MAX_SAMPLED_PAIRS = 500_000
+
 
 class AUCEvaluator:
     """Evaluates camera pose accuracy using AUC metrics."""
 
-    def __init__(self, thresholds: List[int] = None):
+    def __init__(self, thresholds: List[int] = None,
+                 pair_sampling_threshold: int = PAIR_SAMPLING_THRESHOLD,
+                 max_sampled_pairs: int = MAX_SAMPLED_PAIRS):
         """Initialize AUC evaluator.
 
         Args:
             thresholds: List of angle thresholds in degrees (default: [3, 5, 15, 30])
+            pair_sampling_threshold: Frame count above which pair indices are
+                randomly sampled instead of exhaustively enumerated.
+            max_sampled_pairs: Maximum number of pairs to keep when sampling.
         """
         self.thresholds = thresholds if thresholds else DEFAULT_AUC_THRESHOLDS
+        self.pair_sampling_threshold = pair_sampling_threshold
+        self.max_sampled_pairs = max_sampled_pairs
 
     def evaluate(self, gt_loader, pred_loader,
                  logger: Optional[logging.Logger] = None) -> Dict[str, float]:
@@ -105,10 +120,54 @@ class AUCEvaluator:
 
         return metrics
 
-    @staticmethod
-    def _build_pair_index(N: int, B: int = 1) -> Tuple[np.ndarray, np.ndarray]:
-        """Generate all pairwise indices for N frames."""
-        i1_, i2_ = np.triu_indices(N, k=1)
+    def _build_pair_index(self, N: int, B: int = 1
+                          ) -> Tuple[np.ndarray, np.ndarray]:
+        """Generate pairwise indices for N frames.
+
+        When N is small (below ``self.pair_sampling_threshold``), all
+        N*(N-1)/2 upper-triangular pairs are returned.  For long sequences
+        the full set would blow up memory (e.g. 3000 frames → 4.5 M pairs →
+        several GB of float32 temporaries), so we fall back to uniform
+        random sampling of at most ``self.max_sampled_pairs`` pairs.
+
+        A sliding-window strategy is used when sampling: half the budget is
+        spent on nearby pairs (|i-j| <= window_size) to preserve short-range
+        accuracy, and the other half on uniformly random long-range pairs.
+        """
+        total_pairs = N * (N - 1) // 2
+        max_pairs = self.max_sampled_pairs
+
+        if N <= self.pair_sampling_threshold or total_pairs <= max_pairs:
+            # Exhaustive path — safe for short sequences.
+            i1_, i2_ = np.triu_indices(N, k=1)
+        else:
+            # Sampling path — split budget between local and global pairs.
+            rng = np.random.default_rng(seed=42)
+            half = max_pairs // 2
+            window_size = max(2, min(N // 4, 100))
+
+            # Local pairs: |i - j| in [1, window_size]
+            local_i1 = rng.integers(0, N - 1, size=half)
+            local_offsets = rng.integers(1, window_size + 1, size=half)
+            local_i2 = np.minimum(local_i1 + local_offsets, N - 1)
+            # Ensure i1 < i2
+            swap = local_i1 > local_i2
+            local_i1[swap], local_i2[swap] = local_i2[swap].copy(), local_i1[swap].copy()
+            # Drop degenerate (i1 == i2)
+            keep = local_i1 != local_i2
+            local_i1, local_i2 = local_i1[keep], local_i2[keep]
+
+            # Global pairs: fully random upper-triangular
+            global_i1 = rng.integers(0, N - 1, size=half)
+            global_i2 = rng.integers(0, N - 1, size=half)
+            swap = global_i1 > global_i2
+            global_i1[swap], global_i2[swap] = global_i2[swap].copy(), global_i1[swap].copy()
+            keep = global_i1 != global_i2
+            global_i1, global_i2 = global_i1[keep], global_i2[keep]
+
+            i1_ = np.concatenate([local_i1, global_i1])
+            i2_ = np.concatenate([local_i2, global_i2])
+
         if B == 1:
             return i1_, i2_
         else:

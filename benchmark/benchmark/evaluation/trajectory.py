@@ -25,6 +25,18 @@ def _filter_valid_pose_pairs(
     Logs a WARNING if any pairs are dropped (indicates some GT frames lack
     valid poses, e.g. TUM RGB-D timestamp association gaps).
 
+    Note on correctness:
+        Both GT *and* pred must be finite for a frame pair to survive — this is
+        required because ATE/RPE cannot be computed without a valid reference.
+        Frames where pred is valid but GT is missing are therefore excluded
+        from the *evaluation* arrays returned here.  This does **not** remove
+        them from ``traj.txt`` on disk (``write_trajectory`` already skips NaN
+        rows, so pred-only frames are preserved there for viewer display).
+        ``TrajectoryEvaluator.save_visualization`` reconstructs the full GT
+        reference trajectory independently (``gt_full_valid_mask``) so the
+        grey reference path always covers every GT-valid frame regardless of
+        which frames were used for evaluation/alignment.
+
     Returns:
         Filtered (gt_poses, pred_poses, timestamps), all with NaN-free poses.
     Raises:
@@ -68,8 +80,13 @@ def _orthogonalize_se3(pose: np.ndarray) -> np.ndarray:
     try:
         U, _, Vh = np.linalg.svd(R)
     except np.linalg.LinAlgError:
-        # Fall back to QR decomposition if SVD fails to converge
+        # Fall back to QR decomposition if SVD fails to converge.
+        # np.linalg.qr can produce a reflection matrix with det(R) < 0 on
+        # pathological inputs; evo validates SO(3) membership and will reject
+        # such matrices, so we enforce det(Q) > 0 here.
         Q, _ = np.linalg.qr(R)
+        if np.linalg.det(Q) < 0:
+            Q[:, -1] *= -1
         result[:3, :3] = Q
         return result
     R_ortho = U @ Vh
@@ -273,6 +290,12 @@ class TrajectoryEvaluator:
         # which only processed a small portion of frames cannot look deceptively good.
         # Alignment above is still computed against the matched subset (traj_ref), which
         # is correct; only the reference drawn in grey uses the full GT here.
+        #
+        # NOTE: this mask is independent of ``_filter_valid_pose_pairs`` — it checks
+        # GT validity only, so frames where pred is missing but GT is valid still
+        # appear in the grey reference path.  That is the intended behaviour:
+        # the reference path should reflect the *entire* GT trajectory, not just
+        # the subset overlap with the predicted trajectory.
         gt_full_valid_mask = np.isfinite(gt_traj.reshape(len(gt_traj), -1)).all(axis=1)
         gt_full_poses = gt_traj[gt_full_valid_mask]
         gt_full_timestamps = np.where(gt_full_valid_mask)[0].astype(float)
