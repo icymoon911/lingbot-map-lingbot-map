@@ -159,7 +159,12 @@ class DepthEvaluator:
             Returns (None, None) if frame is invalid
         """
         gt_min, gt_max = self.gt_clip
-        valid_mask = (gt_depth > gt_min) & (gt_depth < gt_max)
+        # Enforce a small positive lower bound so that gt values near zero
+        # (which would produce inf/NaN in abs_rel and sq_rel) are excluded.
+        # When gt_clip lower bound is 0.0 the raw comparison `> 0` still
+        # admits values like 1e-6 that blow up the relative-error metrics.
+        gt_min_safe = max(gt_min, 1e-3)
+        valid_mask = (gt_depth > gt_min_safe) & (gt_depth < gt_max)
         valid_mask = valid_mask & np.isfinite(gt_depth) & np.isfinite(pred_depth)
         valid_mask = valid_mask & (pred_depth > 0)
 
@@ -207,26 +212,32 @@ class DepthEvaluator:
 
     @staticmethod
     def _compute_metrics(pred: np.ndarray, gt: np.ndarray) -> Dict[str, float]:
-        """Compute depth metrics on concatenated valid pixels."""
-        abs_rel = np.mean(np.abs(pred - gt) / gt)
-        sq_rel = np.mean((pred - gt) ** 2 / gt)
-        rmse = np.sqrt(np.mean((pred - gt) ** 2))
-        pred_clipped = np.clip(pred, 1e-5, None)
-        gt_clipped = np.clip(gt, 1e-5, None)
-        log_rmse = np.sqrt(np.mean((np.log(pred_clipped) - np.log(gt_clipped)) ** 2))
+        """Compute depth metrics on concatenated valid pixels.
+
+        A small epsilon floor is applied to both pred and gt to guard against
+        division-by-zero in case upstream filtering missed near-zero values.
+        """
+        eps = 1e-5
+        pred = np.maximum(pred, eps)
+        gt   = np.maximum(gt,   eps)
+
+        abs_rel = float(np.mean(np.abs(pred - gt) / gt))
+        sq_rel  = float(np.mean((pred - gt) ** 2 / gt))
+        rmse    = float(np.sqrt(np.mean((pred - gt) ** 2)))
+        log_rmse = float(np.sqrt(np.mean((np.log(pred) - np.log(gt)) ** 2)))
         max_ratio = np.maximum(pred / gt, gt / pred)
-        delta_1_25 = np.mean((max_ratio < 1.25).astype(float)) * 100
-        delta_1_25_2 = np.mean((max_ratio < 1.5625).astype(float)) * 100
-        delta_1_25_3 = np.mean((max_ratio < 1.953125).astype(float)) * 100
+        delta_1_25   = float(np.mean((max_ratio < 1.25).astype(float)) * 100)
+        delta_1_25_2 = float(np.mean((max_ratio < 1.5625).astype(float)) * 100)
+        delta_1_25_3 = float(np.mean((max_ratio < 1.953125).astype(float)) * 100)
 
         return {
-            'abs_rel': float(abs_rel),
-            'sq_rel': float(sq_rel),
-            'rmse': float(rmse),
-            'log_rmse': float(log_rmse),
-            'delta_1_25': float(delta_1_25),
-            'delta_1_25_2': float(delta_1_25_2),
-            'delta_1_25_3': float(delta_1_25_3),
+            'abs_rel': abs_rel,
+            'sq_rel': sq_rel,
+            'rmse': rmse,
+            'log_rmse': log_rmse,
+            'delta_1_25': delta_1_25,
+            'delta_1_25_2': delta_1_25_2,
+            'delta_1_25_3': delta_1_25_3,
         }
 
     def save_visualization(self,

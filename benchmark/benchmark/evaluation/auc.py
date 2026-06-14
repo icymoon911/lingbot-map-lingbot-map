@@ -117,6 +117,75 @@ class AUCEvaluator:
             return i1, i2
 
     @staticmethod
+    def _build_pair_index_sampled(
+        N: int,
+        max_pairs: int = 500_000,
+        rng: Optional[np.random.Generator] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Build a sampled subset of pair indices for long sequences.
+
+        Uses a sliding window (|i-j| <= window_size) to preserve short-range
+        pairs, supplemented with uniformly random far pairs to reach max_pairs.
+        This avoids the O(N^2) memory blow-up on sequences with thousands of
+        frames (e.g., oxford_long, droid_w).
+
+        Args:
+            N:         Number of frames.
+            max_pairs: Target number of pairs (hard cap).
+            rng:       Optional numpy random generator for reproducibility.
+
+        Returns:
+            Tuple of (i1, i2) index arrays of length <= max_pairs.
+        """
+        if rng is None:
+            rng = np.random.default_rng(42)
+
+        total_pairs = N * (N - 1) // 2
+        if total_pairs <= max_pairs:
+            # Small enough — return all pairs (same as _build_pair_index).
+            return np.triu_indices(N, k=1)
+
+        # Sliding window: keep all pairs within this distance.
+        # Choose window so that sliding-window pairs use ~70 % of budget.
+        window_size = max(10, max_pairs * 7 // (10 * N))
+        window_size = min(window_size, N - 1)
+
+        # Build sliding-window pairs column-by-column (avoids huge triu call).
+        cols_i1 = []
+        cols_i2 = []
+        for i in range(N - 1):
+            jmax = min(i + window_size + 1, N)
+            j = np.arange(i + 1, jmax)
+            cols_i1.append(np.full(len(j), i, dtype=np.intp))
+            cols_i2.append(j)
+        near_i1 = np.concatenate(cols_i1)
+        near_i2 = np.concatenate(cols_i2)
+
+        if len(near_i1) >= max_pairs:
+            # Window alone exceeds budget — subsample from window pairs.
+            sel = rng.choice(len(near_i1), size=max_pairs, replace=False)
+            return near_i1[sel], near_i2[sel]
+
+        # Add uniformly random far pairs (|i-j| > window_size) to fill budget.
+        remaining = max_pairs - len(near_i1)
+        # Generate candidate far pairs by rejection sampling (fast in practice
+        # because the far region dominates for large N).
+        far_i1 = rng.integers(0, N - 1, size=remaining * 2)
+        far_i2 = rng.integers(1, N,     size=remaining * 2)
+        far_mask = far_i1 < far_i2
+        far_i1, far_i2 = far_i1[far_mask], far_i2[far_mask]
+        far_distant = (far_i2 - far_i1) > window_size
+        far_i1, far_i2 = far_i1[far_distant], far_i2[far_distant]
+
+        if len(far_i1) > remaining:
+            sel = rng.choice(len(far_i1), size=remaining, replace=False)
+            far_i1, far_i2 = far_i1[sel], far_i2[sel]
+
+        i1 = np.concatenate([near_i1, far_i1])
+        i2 = np.concatenate([near_i2, far_i2])
+        return i1, i2
+
+    @staticmethod
     def _align_to_first_camera(poses: np.ndarray) -> np.ndarray:
         """Align all camera poses to the first camera's coordinate frame."""
         first_pose_inv = invert_transform(poses[0:1])[0]
@@ -154,10 +223,34 @@ class AUCEvaluator:
             rel_tangle_deg = rel_tangle_deg.reshape(batch_size, -1)
         return rel_tangle_deg
 
-    def _se3_to_relative_pose_error(self, pred_se3: np.ndarray, gt_se3: np.ndarray,
-                                    num_frames: int) -> Tuple[np.ndarray, np.ndarray]:
-        """Compute relative pose errors between frame pairs (W2C format)."""
-        pair_idx_i1, pair_idx_i2 = self._build_pair_index(num_frames)
+    def _se3_to_relative_pose_error(
+        self,
+        pred_se3: np.ndarray,
+        gt_se3: np.ndarray,
+        num_frames: int,
+        max_pairs: Optional[int] = 500_000,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Compute relative pose errors between frame pairs (W2C format).
+
+        Args:
+            pred_se3:   (N, 4, 4) predicted extrinsics (W2C).
+            gt_se3:     (N, 4, 4) ground-truth extrinsics (W2C).
+            num_frames: Number of frames N.
+            max_pairs:  If set and N*(N-1)/2 > max_pairs, use sliding-window
+                        + random sampling to cap memory usage.  Set to None
+                        to always compute all pairs.
+
+        Returns:
+            (rel_rangle_deg, rel_tangle_deg) arrays of per-pair errors.
+        """
+        total_pairs = num_frames * (num_frames - 1) // 2
+        if max_pairs is not None and total_pairs > max_pairs:
+            pair_idx_i1, pair_idx_i2 = self._build_pair_index_sampled(
+                num_frames, max_pairs=max_pairs,
+            )
+        else:
+            pair_idx_i1, pair_idx_i2 = self._build_pair_index(num_frames)
+
         relative_pose_gt = invert_transform(gt_se3[pair_idx_i1]) @ gt_se3[pair_idx_i2]
         relative_pose_pred = invert_transform(pred_se3[pair_idx_i1]) @ pred_se3[pair_idx_i2]
         rel_rangle_deg = self._rotation_angle(

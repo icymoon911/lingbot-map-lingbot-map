@@ -351,7 +351,8 @@ class BSSSaver:
         valid = (depth > 0) & np.isfinite(depth)
         if np.any(valid):
             min_d, max_d = np.percentile(depth[valid], [1, 99])
-            save_depth_visualization(depth, depth_jpg, min_d, max_d)
+            if max_d > min_d:
+                save_depth_visualization(depth, depth_jpg, min_d, max_d)
 
     def _save_mask(self, base_name: str, mask: np.ndarray) -> None:
         """Save mask image, resized to GT resolution with nearest-neighbor."""
@@ -382,7 +383,8 @@ class BSSSaver:
         valid = (confidence > 0) & np.isfinite(confidence)
         if np.any(valid):
             min_c, max_c = np.percentile(confidence[valid], [1, 99])
-            save_depth_visualization(confidence, conf_jpg, min_c, max_c)
+            if max_c > min_c:
+                save_depth_visualization(confidence, conf_jpg, min_c, max_c)
 
     def _save_points(self, base_name: str, points: np.ndarray) -> None:
         """Save per-frame world-coordinate point grid as EXR, resized to GT resolution."""

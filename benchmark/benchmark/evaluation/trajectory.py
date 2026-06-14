@@ -22,6 +22,13 @@ def _filter_valid_pose_pairs(
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Drop frame pairs where GT or pred pose contains NaN/Inf.
 
+    A frame is kept for evaluation *only* when both GT and pred are finite.
+    This is the correct metric boundary: frames where the prediction is
+    valid but GT is missing (e.g., TUM RGB-D timestamp-association gaps)
+    are excluded from ATE/RPE — they cannot be scored — but they remain
+    in the raw ``traj.txt`` on disk and are therefore still visible in the
+    full-trajectory viewer (see ``save_visualization`` → ``traj_ref_full``).
+
     Logs a WARNING if any pairs are dropped (indicates some GT frames lack
     valid poses, e.g. TUM RGB-D timestamp association gaps).
 
@@ -33,10 +40,15 @@ def _filter_valid_pose_pairs(
     gt_valid   = np.isfinite(gt_poses.reshape(len(gt_poses), -1)).all(axis=1)
     pred_valid = np.isfinite(pred_poses.reshape(len(pred_poses), -1)).all(axis=1)
     mask = gt_valid & pred_valid
+    n_dropped_gt  = int((~gt_valid).sum())
+    n_dropped_pred = int((gt_valid & ~pred_valid).sum())
     n_dropped = int((~mask).sum())
     if n_dropped > 0:
-        msg = (f"Dropped {n_dropped}/{len(mask)} frame(s) with NaN GT/pred pose "
-               "(GT trajectory is incomplete for these frames)")
+        msg = (
+            f"Dropped {n_dropped}/{len(mask)} frame(s) with NaN GT/pred pose "
+            f"(GT missing: {n_dropped_gt}, pred missing after GT valid: {n_dropped_pred}). "
+            "These frames are excluded from ATE/RPE but remain in traj.txt."
+        )
         if logger:
             logger.warning(msg)
         else:
@@ -68,8 +80,12 @@ def _orthogonalize_se3(pose: np.ndarray) -> np.ndarray:
     try:
         U, _, Vh = np.linalg.svd(R)
     except np.linalg.LinAlgError:
-        # Fall back to QR decomposition if SVD fails to converge
+        # Fall back to QR decomposition if SVD fails to converge.
+        # QR can produce a reflection (det < 0) for ill-conditioned matrices,
+        # so we must check and correct the sign just like the SVD path.
         Q, _ = np.linalg.qr(R)
+        if np.linalg.det(Q) < 0:
+            Q[:, -1] *= -1
         result[:3, :3] = Q
         return result
     R_ortho = U @ Vh
@@ -273,6 +289,9 @@ class TrajectoryEvaluator:
         # which only processed a small portion of frames cannot look deceptively good.
         # Alignment above is still computed against the matched subset (traj_ref), which
         # is correct; only the reference drawn in grey uses the full GT here.
+        # NOTE: traj_ref_full is independent of _filter_valid_pose_pairs — it uses
+        # gt_traj directly with its own NaN filter, so pred-valid-but-GT-missing
+        # frames do NOT appear here (their GT is NaN), while all other GT frames do.
         gt_full_valid_mask = np.isfinite(gt_traj.reshape(len(gt_traj), -1)).all(axis=1)
         gt_full_poses = gt_traj[gt_full_valid_mask]
         gt_full_timestamps = np.where(gt_full_valid_mask)[0].astype(float)

@@ -102,7 +102,7 @@ class BSSArtifact:
             "metadata": metadata or {}
         }
         with open(self.complete_file, 'w') as f:
-            json.dump(data, f, indent=2)
+            json.dump(data, f, indent=2, default=_json_default)
 
     def mark_incomplete(self) -> None:
         if self.complete_file.exists():
